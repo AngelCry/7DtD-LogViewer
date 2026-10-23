@@ -19,11 +19,14 @@ public sealed class LogSession : IDisposable
     private LogSession(LogFile file)
     {
         _file = file;
+        Reader = new LogReader(file, _index);
     }
 
     public LogFile File => _file;
 
     public LogIndex Index => _index;
+
+    public LogReader Reader { get; private set; }
 
     public TimeSpan IndexTime => TimeSpan.FromTicks(Interlocked.Read(ref _indexTimeTicks));
 
