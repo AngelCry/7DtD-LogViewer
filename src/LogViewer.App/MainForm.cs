@@ -28,9 +28,22 @@ internal sealed class MainForm : Form
     private readonly ProgressBar _progressBar;
     private readonly ToolStripStatusLabel _statusLabel;
     private readonly System.Windows.Forms.Timer _refreshTimer;
+    private readonly CheckBox _infoCheck;
+    private readonly CheckBox _warningCheck;
+    private readonly CheckBox _errorCheck;
+    private readonly CheckBox _exceptionCheck;
+    private readonly CheckBox _otherCheck;
+    private readonly TextBox _textFilterBox;
+    private readonly CheckBox _regexCheck;
+    private readonly ToolTip _filterToolTip;
+    private readonly System.Windows.Forms.Timer _filterDebounceTimer;
 
     private LogSession? _session;
     private CancellationTokenSource? _cts;
+    private CancellationTokenSource? _filterCts;
+    private FilterResult? _filterResult;
+    private int _filterVersion;
+    private bool _suppressFilterEvents;
     private int _detailsEntryIndex = -1;
 
     public MainForm()
@@ -52,6 +65,47 @@ internal sealed class MainForm : Form
         _listView.RetrieveVirtualItem += ListView_RetrieveVirtualItem;
         _listView.CacheVirtualItems += ListView_CacheVirtualItems;
         _listView.ItemSelectionChanged += ListView_ItemSelectionChanged;
+
+        _infoCheck = CreateLevelCheckBox("INF");
+        _warningCheck = CreateLevelCheckBox("WRN");
+        _errorCheck = CreateLevelCheckBox("ERR");
+        _exceptionCheck = CreateLevelCheckBox("EXC");
+        _otherCheck = CreateLevelCheckBox("Other");
+
+        _textFilterBox = new TextBox
+        {
+            Width = 260,
+            PlaceholderText = "Text filter",
+            AccessibleName = "Text filter",
+            Margin = new Padding(8, 1, 12, 0),
+        };
+        _textFilterBox.TextChanged += FilterInputChanged;
+
+        _regexCheck = new CheckBox
+        {
+            Text = "Regex",
+            AutoSize = true,
+            Margin = new Padding(0, 3, 0, 0),
+        };
+        _regexCheck.CheckedChanged += FilterInputChanged;
+
+        _filterToolTip = new ToolTip();
+
+        var filterPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 36,
+            Padding = new Padding(6, 7, 6, 5),
+            WrapContents = false,
+            AutoSize = false,
+        };
+        filterPanel.Controls.Add(_infoCheck);
+        filterPanel.Controls.Add(_warningCheck);
+        filterPanel.Controls.Add(_errorCheck);
+        filterPanel.Controls.Add(_exceptionCheck);
+        filterPanel.Controls.Add(_otherCheck);
+        filterPanel.Controls.Add(_textFilterBox);
+        filterPanel.Controls.Add(_regexCheck);
 
         _detailsBox = new TextBox
         {
@@ -75,6 +129,7 @@ internal sealed class MainForm : Form
             SplitterWidth = 5,
         };
         _splitContainer.Panel1.Controls.Add(_listView);
+        _splitContainer.Panel1.Controls.Add(filterPanel);
         _splitContainer.Panel2.Controls.Add(_detailsBox);
 
         _openButton = new Button
@@ -127,6 +182,9 @@ internal sealed class MainForm : Form
 
         _refreshTimer = new System.Windows.Forms.Timer { Interval = 200 };
         _refreshTimer.Tick += (_, _) => UpdateVirtualListSize();
+
+        _filterDebounceTimer = new System.Windows.Forms.Timer { Interval = 300 };
+        _filterDebounceTimer.Tick += FilterDebounceTimer_Tick;
 
         SetIndexingState(false);
     }
@@ -206,9 +264,11 @@ internal sealed class MainForm : Form
             }
         });
 
+        bool completed = false;
         try
         {
             await session.IndexAsync(progress, cts.Token);
+            completed = true;
 
             if (ReferenceEquals(_session, session))
             {
@@ -241,6 +301,12 @@ internal sealed class MainForm : Form
                 _refreshTimer.Stop();
                 UpdateVirtualListSize();
                 SetIndexingState(false);
+
+                // Индекс мог вырасти, пока фильтр уже был активен: применяем его заново.
+                if (completed && !BuildFilter().IsEmpty)
+                {
+                    _ = ApplyFilterAsync();
+                }
             }
 
             if (ReferenceEquals(_cts, cts))
@@ -261,17 +327,19 @@ internal sealed class MainForm : Form
     private void ListView_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
     {
         LogSession? session = _session;
-        if (session is null
-            || e.ItemIndex < 0
-            || e.ItemIndex >= session.Index.Count)
+        int entryIndex = session is null || e.ItemIndex < 0
+            ? -1
+            : MapToEntryIndex(e.ItemIndex);
+
+        if (session is null || entryIndex < 0 || entryIndex >= session.Index.Count)
         {
             e.Item = new ListViewItem(string.Empty);
             return;
         }
 
-        EntryPreview preview = session.Reader.GetPreview(e.ItemIndex);
+        EntryPreview preview = session.Reader.GetPreview(entryIndex);
         var item = new ListViewItem(FormatPreview(preview));
-        ApplyLevelColors(item, session.Index.Level(e.ItemIndex));
+        ApplyLevelColors(item, session.Index.Level(entryIndex));
         e.Item = item;
     }
 
@@ -283,13 +351,17 @@ internal sealed class MainForm : Form
             return;
         }
 
-        int count = session.Index.Count;
+        int count = _filterResult?.Visible?.Count ?? session.Index.Count;
         int end = Math.Min(e.EndIndex, count - 1);
         try
         {
             for (int i = Math.Max(e.StartIndex, 0); i <= end; i++)
             {
-                session.Reader.GetPreview(i);
+                int entryIndex = MapToEntryIndex(i);
+                if (entryIndex >= 0)
+                {
+                    session.Reader.GetPreview(entryIndex);
+                }
             }
         }
         catch (Exception)
@@ -365,9 +437,19 @@ internal sealed class MainForm : Form
 
     /// <summary>
     /// Маппинг индекса строки списка в индекс записи <see cref="LogIndex"/>.
-    /// Пока фильтров нет (шаг 9) отображение тождественное.
+    /// При активном фильтре индекс строки — позиция в <see cref="FilterResult.Visible"/>;
+    /// -1, если позиция вне списка.
     /// </summary>
-    private int MapToEntryIndex(int viewIndex) => viewIndex;
+    private int MapToEntryIndex(int viewIndex)
+    {
+        VisibleList? visible = _filterResult?.Visible;
+        if (visible is null)
+        {
+            return viewIndex;
+        }
+
+        return (uint)viewIndex < (uint)visible.Count ? visible[viewIndex] : -1;
+    }
 
     private async void CopySelectedEntriesAsync()
     {
@@ -515,11 +597,237 @@ internal sealed class MainForm : Form
             return;
         }
 
-        int count = session.Index.Count;
+        int count = _filterResult?.Visible?.Count ?? session.Index.Count;
         if (_listView.VirtualListSize != count)
         {
             _listView.VirtualListSize = count;
         }
+    }
+
+    private CheckBox CreateLevelCheckBox(string text)
+    {
+        var checkBox = new CheckBox
+        {
+            Text = text,
+            Checked = true,
+            AutoSize = true,
+            Margin = new Padding(0, 3, 12, 0),
+        };
+        checkBox.CheckedChanged += FilterInputChanged;
+        return checkBox;
+    }
+
+    private void FilterInputChanged(object? sender, EventArgs e)
+    {
+        if (_suppressFilterEvents || _session is null)
+        {
+            return;
+        }
+
+        // Ввод изменился — результат уже запущенного прохода неактуален.
+        _filterVersion++;
+        _filterCts?.Cancel();
+        _filterCts = null;
+
+        ClearFilterError();
+        _filterDebounceTimer.Stop();
+        _filterDebounceTimer.Start();
+    }
+
+    private void FilterDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        _filterDebounceTimer.Stop();
+        _ = ApplyFilterAsync();
+    }
+
+    private async Task ApplyFilterAsync()
+    {
+        LogSession? session = _session;
+        if (session is null || IsDisposed)
+        {
+            return;
+        }
+
+        LogFilter filter = BuildFilter();
+        if (!FilterEngine.TryValidate(filter, out string? error))
+        {
+            // Фильтр не применяется: остаётся предыдущий результат.
+            _filterVersion++;
+            _filterCts?.Cancel();
+            _filterCts = null;
+            SetFilterError(error ?? "Invalid regular expression.");
+            return;
+        }
+
+        ClearFilterError();
+
+        int version = ++_filterVersion;
+        var cts = new CancellationTokenSource();
+        _filterCts?.Cancel();
+        _filterCts = cts;
+
+        int selectedEntry = GetSelectedEntryIndex();
+        _statusLabel.Text = "Filtering…";
+
+        var progress = new Progress<int>(percent =>
+        {
+            if (!IsDisposed && version == _filterVersion)
+            {
+                _statusLabel.Text = $"Filtering… {Math.Clamp(percent, 0, 100)}%";
+            }
+        });
+
+        FilterResult? result = null;
+        try
+        {
+            result = await FilterEngine.RunAsync(
+                session.File,
+                session.Index,
+                filter,
+                progress,
+                cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Отменённый запуск не применяется.
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed && version == _filterVersion && ReferenceEquals(session, _session))
+            {
+                _statusLabel.Text = $"Filter failed: {ex.Message}";
+                ShowError("Filter failed", ex);
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_filterCts, cts))
+            {
+                _filterCts = null;
+            }
+
+            cts.Dispose();
+        }
+
+        if (result is null
+            || IsDisposed
+            || version != _filterVersion
+            || !ReferenceEquals(session, _session))
+        {
+            return;
+        }
+
+        ApplyFilterResult(session, result, selectedEntry);
+    }
+
+    private void ApplyFilterResult(LogSession session, FilterResult result, int selectedEntry)
+    {
+        _filterResult = result;
+        int visibleCount = result.Visible?.Count ?? session.Index.Count;
+        _listView.VirtualListSize = visibleCount;
+        _statusLabel.Text = $"Shown: {visibleCount} of {session.Index.Count}";
+
+        int viewIndex = -1;
+        if (selectedEntry >= 0 && visibleCount > 0)
+        {
+            viewIndex = result.Visible?.IndexOfOrNearest(selectedEntry) ?? selectedEntry;
+            if (viewIndex >= visibleCount)
+            {
+                viewIndex = visibleCount - 1;
+            }
+        }
+
+        int entryIndex = viewIndex >= 0 ? MapToEntryIndex(viewIndex) : -1;
+        if (entryIndex < 0)
+        {
+            _detailsEntryIndex = -1;
+            _listView.SelectedIndices.Clear();
+            _detailsBox.Clear();
+            return;
+        }
+
+        // Восстанавливаем выбор на ближайшей видимой записи.
+        _listView.SelectedIndices.Clear();
+        _detailsEntryIndex = entryIndex;
+        _listView.SelectedIndices.Add(viewIndex);
+        _listView.EnsureVisible(viewIndex);
+        ShowDetails(entryIndex);
+    }
+
+    private LogFilter BuildFilter()
+    {
+        LogLevelMask levels = LogLevelMask.None;
+        if (_infoCheck.Checked)
+        {
+            levels |= LogLevelMask.Info;
+        }
+
+        if (_warningCheck.Checked)
+        {
+            levels |= LogLevelMask.Warning;
+        }
+
+        if (_errorCheck.Checked)
+        {
+            levels |= LogLevelMask.Error;
+        }
+
+        if (_exceptionCheck.Checked)
+        {
+            levels |= LogLevelMask.Exception;
+        }
+
+        if (_otherCheck.Checked)
+        {
+            levels |= LogLevelMask.Other;
+        }
+
+        return new LogFilter(levels, _textFilterBox.Text, _regexCheck.Checked);
+    }
+
+    private int GetSelectedEntryIndex()
+    {
+        return _listView.SelectedIndices.Count > 0
+            ? MapToEntryIndex(_listView.SelectedIndices[0])
+            : -1;
+    }
+
+    private void SetFilterError(string error)
+    {
+        _textFilterBox.BackColor = Color.FromArgb(0xFF, 0xCD, 0xD2);
+        _filterToolTip.SetToolTip(_textFilterBox, error);
+        _statusLabel.Text = "Invalid regex";
+    }
+
+    private void ClearFilterError()
+    {
+        if (_textFilterBox.BackColor != SystemColors.Window)
+        {
+            _textFilterBox.BackColor = SystemColors.Window;
+        }
+
+        _filterToolTip.SetToolTip(_textFilterBox, string.Empty);
+    }
+
+    private void ResetFilterControls()
+    {
+        _suppressFilterEvents = true;
+        try
+        {
+            _infoCheck.Checked = true;
+            _warningCheck.Checked = true;
+            _errorCheck.Checked = true;
+            _exceptionCheck.Checked = true;
+            _otherCheck.Checked = true;
+            _textFilterBox.Text = string.Empty;
+            _regexCheck.Checked = false;
+        }
+        finally
+        {
+            _suppressFilterEvents = false;
+        }
+
+        ClearFilterError();
     }
 
     private void SetIndexingState(bool indexing)
@@ -531,6 +839,14 @@ internal sealed class MainForm : Form
     private void DisposeSession()
     {
         _refreshTimer.Stop();
+        _filterDebounceTimer.Stop();
+
+        // Инвалидируем все запущенные фильтрации: их результаты уже неактуальны.
+        _filterVersion++;
+        _filterCts?.Cancel();
+        _filterCts = null;
+        _filterResult = null;
+        ResetFilterControls();
 
         var cts = _cts;
         _cts = null;
@@ -548,8 +864,11 @@ internal sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _refreshTimer.Stop();
+        _filterDebounceTimer.Stop();
         DisposeSession();
         _refreshTimer.Dispose();
+        _filterDebounceTimer.Dispose();
+        _filterToolTip.Dispose();
         base.OnFormClosed(e);
     }
 
