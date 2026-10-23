@@ -1,0 +1,42 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+publish/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.DotSettings.user
+
+## Test results
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+TestResults/
+
+## NuGet
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+
+## OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+## Generated logs / local data
+logs/
+*.log
+!docs/**/*.log
+!samples/**/*.log
