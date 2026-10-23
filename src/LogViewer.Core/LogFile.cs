@@ -10,6 +10,7 @@ public sealed class LogFile : IDisposable
 {
     private readonly FileStream _stream;
     private readonly SafeFileHandle _handle;
+    private long _readCallCount;
     private bool _disposed;
 
     private LogFile(FileStream stream)
@@ -61,6 +62,8 @@ public sealed class LogFile : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
 
+        Interlocked.Increment(ref _readCallCount);
+
         int total = 0;
         while (total < destination.Length)
         {
@@ -75,6 +78,9 @@ public sealed class LogFile : IDisposable
 
         return total;
     }
+
+    /// <summary>Диагностика: число вызовов <see cref="Read"/>.</summary>
+    internal long ReadCallCount => Interlocked.Read(ref _readCallCount);
 
     public void Dispose()
     {
