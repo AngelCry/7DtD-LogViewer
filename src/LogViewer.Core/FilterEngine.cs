@@ -145,13 +145,14 @@ public static class FilterEngine
         }
 
         var visible = new VisibleList();
-        if (string.IsNullOrEmpty(filter.Text))
+        if (string.IsNullOrEmpty(filter.Text) && !filter.HasExcludes)
         {
+            // Только уровни — файл не читается.
             RunLevelOnly(index, filter.Levels, total, 0, visible, progress, ct);
             return new FilterResult(filter, visible, total);
         }
 
-        RunWithText(file, index, filter, regex!, total, 0, visible, progress, windowSize, ct);
+        RunWithText(file, index, filter, regex, total, 0, visible, progress, windowSize, ct);
         return new FilterResult(filter, visible, total);
     }
 
@@ -173,7 +174,7 @@ public static class FilterEngine
 
         VisibleList visible = previous.Visible;
         int startIndex = Math.Max(0, previous.ProcessedCount - 1);
-        bool levelOnly = string.IsNullOrEmpty(filter.Text);
+        bool levelOnly = string.IsNullOrEmpty(filter.Text) && !filter.HasExcludes;
 
         if (startIndex < total)
         {
@@ -196,7 +197,7 @@ public static class FilterEngine
             }
             else
             {
-                RunWithText(file, index, filter, regex!, total, startIndex + 1, visible, progress, DefaultWindowSize, ct);
+                RunWithText(file, index, filter, regex, total, startIndex + 1, visible, progress, DefaultWindowSize, ct);
             }
         }
 
@@ -241,8 +242,8 @@ public static class FilterEngine
     }
 
     /// <summary>
-    /// Общий метод сопоставления записи с фильтром (уровень + текст/регулярное выражение).
-    /// Используется как <see cref="RunAsync"/>, так и <see cref="ExtendAsync"/>.
+    /// Общий метод сопоставления записи с фильтром (уровень + текст/регулярное выражение
+    /// + исключения). Используется как <see cref="RunAsync"/>, так и <see cref="ExtendAsync"/>.
     /// </summary>
     internal static bool MatchesEntry(
         LogLevel level,
@@ -255,12 +256,32 @@ public static class FilterEngine
             return false;
         }
 
-        if (string.IsNullOrEmpty(filter.Text))
+        bool hasExcludes = filter.HasExcludes;
+        if (string.IsNullOrEmpty(filter.Text) && !hasExcludes)
         {
             return true;
         }
 
         string text = Encoding.UTF8.GetString(textBytes);
+
+        // Исключения проверяются без учёта регистра: совпадение исключает запись.
+        if (hasExcludes)
+        {
+            foreach (string exclude in filter.Excludes!)
+            {
+                if (!string.IsNullOrEmpty(exclude) &&
+                    text.Contains(exclude, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+        }
+
+        if (string.IsNullOrEmpty(filter.Text))
+        {
+            return true;
+        }
+
         return filter.IsRegex
             ? SafeIsMatch(regex!, text)
             : text.Contains(filter.Text, StringComparison.OrdinalIgnoreCase);
@@ -296,7 +317,7 @@ public static class FilterEngine
         LogFile file,
         LogIndex index,
         LogFilter filter,
-        Regex regex,
+        Regex? regex,
         int total,
         int startIndex,
         VisibleList visible,

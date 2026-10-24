@@ -302,6 +302,128 @@ public sealed class FilterEngineTests : IDisposable
         Assert.Equal(index.Count, result.ProcessedCount);
     }
 
+    [Fact]
+    public void IsEmpty_AccountsForExcludes()
+    {
+        Assert.True(new LogFilter(LogLevelMask.All, string.Empty, false, []).IsEmpty);
+        Assert.False(new LogFilter(LogLevelMask.All, string.Empty, false, ["foo"]).IsEmpty);
+    }
+
+    [Fact]
+    public async Task ExcludesFilter_RemovesMatchingEntries()
+    {
+        using LogFile file = OpenFile(FiveLevels);
+        LogIndex index = Index(file);
+
+        FilterResult result = await FilterEngine.RunAsync(
+            file,
+            index,
+            new LogFilter(LogLevelMask.All, string.Empty, IsRegex: false, Excludes: ["gamma"]),
+            null,
+            CancellationToken.None);
+
+        Assert.NotNull(result.Visible);
+        int[] visible = ToArray(result.Visible);
+        Assert.DoesNotContain(2, visible); // gamma
+        Assert.Equal(new[] { 0, 1, 3, 4 }, visible);
+    }
+
+    [Fact]
+    public async Task ExcludesFilter_IsCaseInsensitive()
+    {
+        using LogFile file = OpenFile(FiveLevels);
+        LogIndex index = Index(file);
+
+        FilterResult result = await FilterEngine.RunAsync(
+            file,
+            index,
+            new LogFilter(LogLevelMask.All, string.Empty, IsRegex: false, Excludes: ["GAMMA"]),
+            null,
+            CancellationToken.None);
+
+        Assert.NotNull(result.Visible);
+        int[] visible = ToArray(result.Visible);
+        Assert.DoesNotContain(2, visible); // gamma
+        Assert.Equal(new[] { 0, 1, 3, 4 }, visible);
+    }
+
+    [Fact]
+    public async Task ExcludesOnly_WithEmptyTextAndAllLevels_StillExcludes()
+    {
+        using LogFile file = OpenFile(FiveLevels);
+        LogIndex index = Index(file);
+
+        // Levels = All, Text пустой, но Excludes не пустой — записи с "gamma" исключаются.
+        FilterResult result = await FilterEngine.RunAsync(
+            file,
+            index,
+            new LogFilter(LogLevelMask.All, string.Empty, IsRegex: false, Excludes: ["gamma"]),
+            null,
+            CancellationToken.None);
+
+        Assert.False(result.Filter.IsEmpty);
+        Assert.NotNull(result.Visible);
+        int[] visible = ToArray(result.Visible);
+        Assert.DoesNotContain(2, visible);
+        Assert.Equal(new[] { 0, 1, 3, 4 }, visible);
+    }
+
+    [Fact]
+    public async Task ExcludesFilter_CombinedWithText()
+    {
+        using LogFile file = OpenFile(FiveLevels);
+        LogIndex index = Index(file);
+
+        // Текст "hello" подходит всем, но запись с gamma исключается.
+        FilterResult result = await FilterEngine.RunAsync(
+            file,
+            index,
+            new LogFilter(LogLevelMask.All, "hello", IsRegex: false, Excludes: ["gamma"]),
+            null,
+            CancellationToken.None);
+
+        Assert.NotNull(result.Visible);
+        Assert.Equal(new[] { 0, 1, 3, 4 }, ToArray(result.Visible));
+    }
+
+    [Fact]
+    public async Task ExtendAsync_AppliesExcludesToNewEntriesAndRechecksLast()
+    {
+        string path = Path.Combine(_tempDir, $"extend-excludes{++_fileCounter}.log");
+        const string initial =
+            "2024-10-23T14:23:45 1.000 INF [A] clean start\n" +
+            "2024-10-23T14:23:45 1.001 INF [A] spam tail\n";
+        File.WriteAllBytes(path, Encoding.UTF8.GetBytes(initial));
+
+        using LogFile file = LogFile.Open(path);
+        var index = new LogIndex();
+        new LogIndexer().IndexRange(file, index, 0, file.Length, null, CancellationToken.None);
+
+        var filter = new LogFilter(LogLevelMask.All, string.Empty, IsRegex: false, Excludes: ["spam"]);
+        FilterResult previous = await FilterEngine.RunAsync(file, index, filter, null, CancellationToken.None);
+        Assert.Equal(new[] { 0 }, ToArray(previous.Visible));
+
+        // Дописываем новые записи; последняя ранее обработанная запись становится непроходной
+        // (в неё дописывается стектрейс со словом spam), плюс добавляются новые проходные/непроходные.
+        const string appended =
+            "  at Game.Spam.Update ()\n" +
+            "2024-10-23T14:23:45 1.002 INF [A] another clean\n" +
+            "2024-10-23T14:23:45 1.003 WRN [A] full of spam here\n";
+        using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        {
+            stream.Write(Encoding.UTF8.GetBytes(appended));
+        }
+
+        new LogIndexer().IndexRange(file, index, index.IndexedLength, file.Length, null, CancellationToken.None);
+
+        FilterResult extended = await FilterEngine.ExtendAsync(file, index, previous, null, CancellationToken.None);
+        FilterResult fresh = await FilterEngine.RunAsync(file, index, filter, null, CancellationToken.None);
+
+        Assert.Equal(fresh.Visible?.Count, extended.Visible?.Count);
+        Assert.Equal(ToArray(fresh.Visible), ToArray(extended.Visible));
+        Assert.Equal(index.Count, extended.ProcessedCount);
+    }
+
     private static int[] ManualMatches(LogIndex index, LogReader reader, LogFilter filter)
     {
         Regex? regex = filter.IsRegex

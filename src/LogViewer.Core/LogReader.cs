@@ -2,7 +2,13 @@ using System.Text;
 
 namespace LogViewer.Core;
 
-public readonly record struct EntryPreview(string FirstLine, int LineCount, bool Truncated);
+public readonly record struct EntryPreview(
+    string Timestamp,
+    string Level,
+    string Component,
+    string Message,
+    int LineCount,
+    bool Truncated);
 
 /// <summary>
 /// Чтение записей лога по индексу. Превью кэшируются в LRU-кэше,
@@ -43,7 +49,7 @@ public sealed class LogReader
 
         if (!TryReadText(i, PreviewMaxBytes, out string text, out bool truncated, out string? error))
         {
-            return new EntryPreview(error!, 0, false);
+            return new EntryPreview(error!, "Other", "", "", 0, false);
         }
 
         string visibleText = text.TrimEnd('\r', '\n');
@@ -52,8 +58,14 @@ public sealed class LogReader
             visibleText += TruncatedSuffix;
         }
 
+        string firstLine = ExtractFirstLine(visibleText);
+        var (timestamp, level, component, message) = ParseFirstLine(firstLine);
+
         var preview = new EntryPreview(
-            ExtractFirstLine(visibleText),
+            timestamp,
+            level,
+            component,
+            message,
             CountLines(text),
             truncated);
 
@@ -216,5 +228,114 @@ public sealed class LogReader
         }
 
         return chars is null ? firstLine : new string(chars);
+    }
+
+    /// <summary>
+    /// Разбирает первую строку записи на поля: Timestamp, Level, Component, Message.
+    /// </summary>
+    private static (string Timestamp, string Level, string Component, string Message) ParseFirstLine(string firstLine)
+    {
+        string timestamp;
+        int levelStart;
+
+        // Пытаемся найти timestamp: 19 символов даты/времени + пробел + секунды
+        if (firstLine.Length >= 20 && firstLine[19] == ' ')
+        {
+            int secondsStart = 20;
+            int secondsEnd = secondsStart;
+            while (secondsEnd < firstLine.Length &&
+                   (char.IsDigit(firstLine[secondsEnd]) || firstLine[secondsEnd] == '.'))
+            {
+                secondsEnd++;
+            }
+
+            if (secondsEnd > secondsStart && secondsEnd < firstLine.Length && firstLine[secondsEnd] == ' ')
+            {
+                // Найдены секунды: "2024-10-23T14:23:45 123.456"
+                timestamp = firstLine[..secondsEnd];
+                levelStart = secondsEnd + 1;
+            }
+            else
+            {
+                // Секунды не найдены: вся FirstLine до уровня — это timestamp
+                timestamp = firstLine.Length >= 19 ? firstLine[..19] : firstLine;
+                levelStart = 19;
+                if (levelStart < firstLine.Length && firstLine[levelStart] == ' ')
+                {
+                    levelStart++;
+                }
+            }
+        }
+        else
+        {
+            // Нет timestamp вообще
+            timestamp = "";
+            levelStart = 0;
+        }
+
+        // Уровень: 3 символа после timestamp
+        string level;
+        int afterLevel;
+        if (levelStart + 3 <= firstLine.Length)
+        {
+            level = firstLine[levelStart..(levelStart + 3)];
+            afterLevel = levelStart + 3;
+        }
+        else if (levelStart < firstLine.Length)
+        {
+            level = firstLine[levelStart..];
+            afterLevel = firstLine.Length;
+        }
+        else
+        {
+            level = "";
+            afterLevel = firstLine.Length;
+        }
+
+        // Нормализация уровня
+        if (level != "INF" && level != "WRN" && level != "ERR" && level != "EXC")
+        {
+            level = "Other";
+        }
+
+        // Пропускаем пробел после уровня
+        int componentStart = afterLevel;
+        if (componentStart < firstLine.Length && firstLine[componentStart] == ' ')
+        {
+            componentStart++;
+        }
+
+        // Компонент: если начинается с [, читаем до ] включительно
+        string component;
+        int messageStart;
+        if (componentStart < firstLine.Length && firstLine[componentStart] == '[')
+        {
+            int bracketEnd = firstLine.IndexOf(']', componentStart);
+            if (bracketEnd >= 0)
+            {
+                component = firstLine[componentStart..(bracketEnd + 1)];
+                messageStart = bracketEnd + 1;
+            }
+            else
+            {
+                component = "";
+                messageStart = componentStart;
+            }
+        }
+        else
+        {
+            component = "";
+            messageStart = componentStart;
+        }
+
+        // Пропускаем пробел перед сообщением
+        if (messageStart < firstLine.Length && firstLine[messageStart] == ' ')
+        {
+            messageStart++;
+        }
+
+        string message = messageStart < firstLine.Length ? firstLine[messageStart..] : "";
+
+        return (timestamp, level, component, message);
     }
 }

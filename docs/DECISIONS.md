@@ -57,6 +57,16 @@
 Шаг 10: `FilterEngine.ExtendAsync` производит инкрементальную фильтрацию новых записей и обновляет совпадение для усечённой/дописанной последней записи, используя общую функцию проверки `MatchesEntry`.
 Шаг 10: `LogGen generate --follow` дописывает файл в режиме реального времени, включая неполные строки с принудительным `writer.Flush()` и автоусечение `--truncate-every-sec`.
 
+Шаг 11: `EntryPreview` расширен полями `Timestamp`, `Level`, `Component`, `Message` вместо одного `FirstLine`; парсинг выполняется один раз в `GetPreview` и кэшируется в LRU.
+Шаг 11: `MainForm` использует 4 колонки (`Time`, `Level`, `Component`, `Message`) с `SubItems`; подсветка остаётся на всю строку (перенос на OwnerDraw отложен на шаг 13).
+Шаг 11: ширина колонок сохраняется в `%AppData%\7DTDLogViewer\settings.json` (`{ "columnWidths": [...] }`), загружается при старте, сохраняется при `FormClosing`; ошибки чтения/записи игнорируются.
+
+Шаг 12: у `LogFilter.Excludes` добавлено значение по умолчанию `null` — 16 существующих мест создания фильтра (тесты) не изменились; движок нормализует null в «нет исключений». Публичный API обратно совместим.
+Шаг 12: excludes проверяются в общем `MatchesEntry` (OrdinalIgnoreCase) перед текстом; совпадение любой строки-исключения убирает запись из результата.
+Шаг 12: если Excludes не пуст, а Text пуст — проход идёт по текстовому пути (`RunWithText`), так как проверка исключений требует чтения файла; чисто уровневый путь (`RunLevelOnly`) используется только без excludes.
+Шаг 12: контекстное меню списка («Exclude this message» / «Exclude this component» / «Clear all excludes»); исключение сообщения берётся из `EntryPreview.Message` и обрезается до 100 символов (`ExcludeMaxLength`), чтобы не хранить гигантские стектрейсы.
+Шаг 12: excludes сохраняются в тот же `settings.json` (`"excludes": [...]`) и переживают перезапуск; счётчик виден в статус-баре `[Excludes: N]`.
+
 # Smoke test и общие соглашения (не относится к конкретному шагу)
 
 Smoke test: `tests/LogViewer.Tests/PlayerLogTests.cs` индексирует `samples/Player.log` и проверяет инварианты (`Other < 2%`, `End(i) > Offset(i)`, `End(last) == IndexedLength`, `IndexedLength == File.Length`). Это НЕ часть workflow шагов 1–10, а защита от регрессии индексатора. При выполнении шагов 4+:

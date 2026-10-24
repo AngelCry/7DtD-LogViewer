@@ -1,5 +1,7 @@
 using System.Globalization;
+using System.IO;
 using System.Text;
+using System.Text.Json;
 using LogViewer.Core;
 
 namespace LogViewer.App;
@@ -39,6 +41,10 @@ internal sealed class MainForm : Form
     private readonly CheckBox _followCheck;
     private readonly ToolTip _filterToolTip;
     private readonly System.Windows.Forms.Timer _filterDebounceTimer;
+    private readonly ToolStripStatusLabel _excludesLabel;
+    private readonly List<string> _excludes = new();
+
+    private const int ExcludeMaxLength = 100;
 
     private LogSession? _session;
     private CancellationTokenSource? _cts;
@@ -49,6 +55,18 @@ internal sealed class MainForm : Form
     private int _detailsEntryIndex = -1;
     private int _lastGeneration;
     private DateTime _lastSizeUpdateTick = DateTime.MinValue;
+
+    private static readonly string SettingsDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "7DTDLogViewer");
+    private static readonly string SettingsFile = Path.Combine(SettingsDir, "settings.json");
+
+    private sealed class ViewerSettings
+    {
+        public int[]? ColumnWidths { get; set; }
+
+        public string[]? Excludes { get; set; }
+    }
 
     public MainForm()
     {
@@ -65,7 +83,10 @@ internal sealed class MainForm : Form
             HideSelection = false,
             MultiSelect = true,
         };
-        _listView.Columns.Add("Entry", 1000, HorizontalAlignment.Left);
+        _listView.Columns.Add("Time", 220, HorizontalAlignment.Right);
+        _listView.Columns.Add("Level", 50, HorizontalAlignment.Left);
+        _listView.Columns.Add("Component", 200, HorizontalAlignment.Left);
+        _listView.Columns.Add("Message", 600, HorizontalAlignment.Left);
         _listView.RetrieveVirtualItem += ListView_RetrieveVirtualItem;
         _listView.CacheVirtualItems += ListView_CacheVirtualItems;
         _listView.ItemSelectionChanged += ListView_ItemSelectionChanged;
@@ -198,12 +219,33 @@ internal sealed class MainForm : Form
             Spring = true,
             TextAlign = ContentAlignment.MiddleLeft,
         };
+        _excludesLabel = new ToolStripStatusLabel(string.Empty)
+        {
+            AutoSize = true,
+            TextAlign = ContentAlignment.MiddleLeft,
+        };
         var statusStrip = new StatusStrip();
         statusStrip.Items.Add(_statusLabel);
-
+        statusStrip.Items.Add(_excludesLabel);
         Controls.Add(_splitContainer);
         Controls.Add(statusStrip);
         Controls.Add(topPanel);
+
+        var contextMenu = new ContextMenuStrip();
+        var excludeMessageItem = new ToolStripMenuItem("Exclude this message");
+        excludeMessageItem.Click += ExcludeMessage_Click;
+        var excludeComponentItem = new ToolStripMenuItem("Exclude this component");
+        excludeComponentItem.Click += ExcludeComponent_Click;
+        var clearExcludesItem = new ToolStripMenuItem("Clear all excludes");
+        clearExcludesItem.Click += ClearExcludes_Click;
+        contextMenu.Items.AddRange(new ToolStripItem[]
+        {
+            excludeMessageItem,
+            excludeComponentItem,
+            new ToolStripSeparator(),
+            clearExcludesItem,
+        });
+        _listView.ContextMenuStrip = contextMenu;
 
         _refreshTimer = new System.Windows.Forms.Timer { Interval = 300 };
         _refreshTimer.Tick += RefreshTimer_Tick;
@@ -229,6 +271,70 @@ internal sealed class MainForm : Form
         if (distance >= _splitContainer.Panel1MinSize)
         {
             _splitContainer.SplitterDistance = distance;
+        }
+
+        LoadColumnWidths();
+    }
+
+    private void LoadColumnWidths()
+    {
+        try
+        {
+            if (!File.Exists(SettingsFile))
+            {
+                return;
+            }
+
+            string json = File.ReadAllText(SettingsFile);
+            var settings = JsonSerializer.Deserialize<ViewerSettings>(json);
+
+            int[]? widths = settings?.ColumnWidths;
+            if (widths is not null && widths.Length == _listView.Columns.Count)
+            {
+                for (int i = 0; i < widths.Length; i++)
+                {
+                    if (widths[i] > 0)
+                    {
+                        _listView.Columns[i].Width = widths[i];
+                    }
+                }
+            }
+
+            if (settings?.Excludes is { Length: > 0 } excludes)
+            {
+                _excludes.Clear();
+                _excludes.AddRange(excludes);
+                UpdateExcludesIndicator();
+            }
+        }
+        catch
+        {
+            // Ошибки чтения настроек не должны ронять приложение.
+        }
+    }
+
+    private void SaveColumnWidths()
+    {
+        try
+        {
+            Directory.CreateDirectory(SettingsDir);
+
+            var settings = new ViewerSettings
+            {
+                ColumnWidths = new int[_listView.Columns.Count],
+                Excludes = _excludes.ToArray(),
+            };
+            for (int i = 0; i < _listView.Columns.Count; i++)
+            {
+                settings.ColumnWidths[i] = _listView.Columns[i].Width;
+            }
+
+            string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = false });
+            File.WriteAllText(SettingsFile, json);
+        }
+        catch
+        {
+            // Ошибки записи настроек не должны ронять приложение.
         }
     }
 
@@ -499,7 +605,19 @@ internal sealed class MainForm : Form
         }
 
         EntryPreview preview = session.Reader.GetPreview(entryIndex);
-        var item = new ListViewItem(FormatPreview(preview));
+        var item = new ListViewItem(preview.Timestamp);
+        item.SubItems.Add(preview.Level);
+        item.SubItems.Add(preview.Component);
+
+        string message = preview.Message;
+        if (preview.LineCount > 1)
+        {
+            message += preview.Truncated
+                ? $" [+{preview.LineCount - 1} lines…]"
+                : $" [+{preview.LineCount - 1} lines]";
+        }
+        item.SubItems.Add(message);
+
         ApplyLevelColors(item, session.Index.Level(entryIndex));
         e.Item = item;
     }
@@ -529,19 +647,6 @@ internal sealed class MainForm : Form
         {
             // Прогрев кэша — оптимизация.
         }
-    }
-
-    private static string FormatPreview(EntryPreview preview)
-    {
-        if (preview.LineCount <= 1)
-        {
-            return preview.FirstLine;
-        }
-
-        int additionalLines = preview.LineCount - 1;
-        return preview.Truncated
-            ? $"{preview.FirstLine} [+{additionalLines} lines…]"
-            : $"{preview.FirstLine} [+{additionalLines} lines]";
     }
 
     private static void ApplyLevelColors(ListViewItem item, LogLevel level)
@@ -966,7 +1071,83 @@ internal sealed class MainForm : Form
             levels |= LogLevelMask.Other;
         }
 
-        return new LogFilter(levels, _textFilterBox.Text, _regexCheck.Checked);
+        return new LogFilter(levels, _textFilterBox.Text, _regexCheck.Checked, _excludes.ToArray());
+    }
+
+    private void ExcludeMessage_Click(object? sender, EventArgs e)
+    {
+        LogSession? session = _session;
+        if (session is null || _listView.SelectedIndices.Count == 0)
+        {
+            return;
+        }
+
+        int entryIndex = MapToEntryIndex(_listView.SelectedIndices[0]);
+        if (entryIndex < 0)
+        {
+            return;
+        }
+
+        EntryPreview preview = session.Reader.GetPreview(entryIndex);
+        AddExclude(preview.Message);
+    }
+
+    private void ExcludeComponent_Click(object? sender, EventArgs e)
+    {
+        LogSession? session = _session;
+        if (session is null || _listView.SelectedIndices.Count == 0)
+        {
+            return;
+        }
+
+        int entryIndex = MapToEntryIndex(_listView.SelectedIndices[0]);
+        if (entryIndex < 0)
+        {
+            return;
+        }
+
+        EntryPreview preview = session.Reader.GetPreview(entryIndex);
+        if (string.IsNullOrEmpty(preview.Component))
+        {
+            return;
+        }
+
+        AddExclude(preview.Component);
+    }
+
+    private void AddExclude(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        string exclude = value.Length > ExcludeMaxLength ? value[..ExcludeMaxLength] : value;
+        if (_excludes.Contains(exclude, StringComparer.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _excludes.Add(exclude);
+        UpdateExcludesIndicator();
+        _ = ApplyFilterAsync();
+    }
+
+    private void ClearExcludes_Click(object? sender, EventArgs e)
+    {
+        if (_excludes.Count == 0)
+        {
+            return;
+        }
+
+        _excludes.Clear();
+        UpdateExcludesIndicator();
+        _ = ApplyFilterAsync();
+    }
+
+    private void UpdateExcludesIndicator()
+    {
+        _excludesLabel.Text = _excludes.Count > 0 ? $"[Excludes: {_excludes.Count}]" : string.Empty;
     }
 
     private int GetSelectedEntryIndex()
@@ -1048,6 +1229,7 @@ internal sealed class MainForm : Form
     {
         _refreshTimer.Stop();
         _filterDebounceTimer.Stop();
+        SaveColumnWidths();
         DisposeSession();
         _refreshTimer.Dispose();
         _filterDebounceTimer.Dispose();

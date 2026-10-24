@@ -35,7 +35,10 @@ public sealed class LogReaderTests : IDisposable
 
         EntryPreview preview = reader.GetPreview(0);
 
-        Assert.Equal(line, preview.FirstLine);
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("INF", preview.Level);
+        Assert.Equal("[A]", preview.Component);
+        Assert.Equal("hello", preview.Message);
         Assert.Equal(1, preview.LineCount);
         Assert.False(preview.Truncated);
     }
@@ -50,7 +53,10 @@ public sealed class LogReaderTests : IDisposable
 
         EntryPreview preview = reader.GetPreview(0);
 
-        Assert.Equal(first, preview.FirstLine);
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("INF", preview.Level);
+        Assert.Equal("[A]", preview.Component);
+        Assert.Equal("first", preview.Message);
         Assert.Equal(3, preview.LineCount);
         Assert.False(preview.Truncated);
         Assert.Equal($"{first}\r\n  at Foo\r\n  at Bar", reader.GetFullText(0));
@@ -66,7 +72,10 @@ public sealed class LogReaderTests : IDisposable
 
         EntryPreview preview = reader.GetPreview(0);
 
-        Assert.Equal(line, preview.FirstLine);
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("INF", preview.Level);
+        Assert.Equal("[Мир]", preview.Component);
+        Assert.Equal("Привет, мир!", preview.Message);
         Assert.Equal(line, reader.GetFullText(0));
     }
 
@@ -83,9 +92,9 @@ public sealed class LogReaderTests : IDisposable
 
         Assert.True(preview.Truncated);
         Assert.Equal(1, preview.LineCount);
-        Assert.EndsWith("… [truncated]", preview.FirstLine);
-        Assert.False(preview.FirstLine.Contains('\uFFFD'));
-        Assert.True(preview.FirstLine.Length > 10_000);
+        Assert.EndsWith("… [truncated]", preview.Message);
+        Assert.False(preview.Message.Contains('\uFFFD'));
+        Assert.True(preview.Message.Length > 10_000);
     }
 
     [Fact]
@@ -125,7 +134,104 @@ public sealed class LogReaderTests : IDisposable
 
         EntryPreview preview = reader.GetPreview(0);
 
-        Assert.Equal("2024-10-23T14:23:45 1.0 INF [A] a b c", preview.FirstLine);
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("INF", preview.Level);
+        Assert.Equal("[A]", preview.Component);
+        Assert.Equal("a b c", preview.Message);
+    }
+
+    [Fact]
+    public void GetPreview_EntryWithoutComponent()
+    {
+        const string line = "2024-10-23T14:23:45 1.0 INF hello world";
+        using LogFile file = OpenFile(line + "\n");
+        LogIndex index = Index(file);
+        var reader = new LogReader(file, index);
+
+        EntryPreview preview = reader.GetPreview(0);
+
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("INF", preview.Level);
+        Assert.Equal("", preview.Component);
+        Assert.Equal("hello world", preview.Message);
+    }
+
+    [Fact]
+    public void GetPreview_EntryWithComponent()
+    {
+        const string line = "2024-10-23T14:23:45 1.0 WRN [World] something happened";
+        using LogFile file = OpenFile(line + "\n");
+        LogIndex index = Index(file);
+        var reader = new LogReader(file, index);
+
+        EntryPreview preview = reader.GetPreview(0);
+
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("WRN", preview.Level);
+        Assert.Equal("[World]", preview.Component);
+        Assert.Equal("something happened", preview.Message);
+    }
+
+    [Fact]
+    public void GetPreview_EntryWithExcAndNoComponent()
+    {
+        const string line = "2024-10-23T14:23:45 1.0 EXC boom";
+        using LogFile file = OpenFile(line + "\n");
+        LogIndex index = Index(file);
+        var reader = new LogReader(file, index);
+
+        EntryPreview preview = reader.GetPreview(0);
+
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("EXC", preview.Level);
+        Assert.Equal("", preview.Component);
+        Assert.Equal("boom", preview.Message);
+    }
+
+    [Fact]
+    public void GetPreview_MultiLine_MessageIsFirstLineOnly()
+    {
+        const string first = "2024-10-23T14:23:45 1.0 INF [A] first line";
+        using LogFile file = OpenFile($"{first}\nsecond line\nthird line\n");
+        LogIndex index = Index(file);
+        var reader = new LogReader(file, index);
+
+        EntryPreview preview = reader.GetPreview(0);
+
+        Assert.Equal("first line", preview.Message);
+        Assert.Equal(3, preview.LineCount);
+        Assert.False(preview.Truncated);
+    }
+
+    [Fact]
+    public void GetPreview_EntryWithEmptyMessage()
+    {
+        const string line = "2024-10-23T14:23:45 1.0 INF";
+        using LogFile file = OpenFile(line + "\n");
+        LogIndex index = Index(file);
+        var reader = new LogReader(file, index);
+
+        EntryPreview preview = reader.GetPreview(0);
+
+        Assert.Equal("2024-10-23T14:23:45 1.0", preview.Timestamp);
+        Assert.Equal("INF", preview.Level);
+        Assert.Equal("", preview.Component);
+        Assert.Equal("", preview.Message);
+    }
+
+    [Fact]
+    public void GetPreview_UnknownLevelBecomesOther()
+    {
+        const string line = "2024-10-23T14:23:45 1.0 XYZ [A] hello";
+        using LogFile file = OpenFile(line + "\n");
+        LogIndex index = Index(file);
+        var reader = new LogReader(file, index);
+
+        EntryPreview preview = reader.GetPreview(0);
+
+        Assert.Equal("Other", preview.Level);
+        Assert.Equal("[A]", preview.Component);
+        Assert.Equal("hello", preview.Message);
     }
 
     [Fact]
@@ -140,7 +246,7 @@ public sealed class LogReaderTests : IDisposable
             EntryPreview preview = reader.GetPreview(0);
             string fullText = reader.GetFullText(0);
 
-            Assert.StartsWith("<read error:", preview.FirstLine);
+            Assert.StartsWith("<read error:", preview.Timestamp);
             Assert.Equal(0, preview.LineCount);
             Assert.StartsWith("<read error:", fullText);
         }
