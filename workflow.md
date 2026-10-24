@@ -530,6 +530,61 @@ public Task<PollResult> PollAsync(CancellationToken ct);
 
 ---
 
+## Шаг 11. Колонки: Timestamp, Level, Component, Message
+
+**Цель.** Список перестаёт быть одной «плавающей» колонкой. Каждая часть записи — в своей колонке. Ширина колонок сохраняется между запусками.
+
+**Что сделать.**
+
+1. В `LogViewer.Core` расширить `EntryPreview`:
+
+```csharp
+public readonly record struct EntryPreview(
+    string Timestamp,    // "2024-10-23T14:23:45 123.456"
+    string Level,        // "INF", "WRN", "ERR", "EXC", "Other"
+    string Component,    // "[World]" или "" если компонента нет
+    string Message,      // остаток строки (первая строка записи)
+    int LineCount,
+    bool Truncated);
+```
+
+2. В `LogReader.GetPreview` добавить парсинг `FirstLine` на поля. Правила:
+   - `Timestamp`: первые 19 символов (дата/время) + пробел + секунды (до пробела перед уровнем). Если секунды не найдены — весь `FirstLine` до уровня.
+   - `Level`: 3 символа после timestamp. Если не `INF/WRN/ERR/EXC` — `"Other"`.
+   - `Component`: если следующий непробельный символ `[`, то до `]` включительно. Иначе `""`.
+   - `Message`: остаток строки после компонента (или после уровня, если компонента нет).
+   - Парсинг делается **один раз** в `GetPreview`, результат кэшируется в LRU. Не парсить в `RetrieveVirtualItem`.
+   - Для multi-line записей `Message` содержит только первую строку; полный текст — в `GetFullText`.
+
+3. В `MainForm`:
+   - `_listView.Columns.Add("Time", 220, HorizontalAlignment.Right)`.
+   - `_listView.Columns.Add("Level", 50, HorizontalAlignment.Left)`.
+   - `_listView.Columns.Add("Component", 200, HorizontalAlignment.Left)`.
+   - `_listView.Columns.Add("Message", 600, HorizontalAlignment.Left)`.
+   - `RetrieveVirtualItem` заполняет `item.Text = preview.Timestamp` и `item.SubItems.Add(...)` для остальных.
+   - Для multi-line: `Message = preview.Message + " [+N lines]"` (или `" [+N lines…]"` если `Truncated`).
+   - Подсветку (BackColor) пока оставить на всю строку — перенос на отдельную колонку будет в шаге 13 (OwnerDraw).
+
+4. Сохранение ширины колонок:
+   - Файл `%AppData%\7DTDLogViewer\settings.json` (создать папку при необходимости).
+   - Структура: `{ "columnWidths": [220, 50, 200, 600] }`.
+   - Загружать при старте формы, применять после создания колонок.
+   - Сохранять при `FormClosing` (до `Dispose` сессии).
+   - Ошибки чтения/записи JSON не должны ронять приложение (просто игнорировать).
+
+5. Обновить `LogReaderTests`: для каждой записи проверить, что `Timestamp`, `Level`, `Component`, `Message` разобраны корректно. Добавить тесты:
+   - Запись без компонента (`2024-... 100.000 INF message`): Component = "", Message = "message".
+   - Запись с компонентом (`2024-... 100.000 WRN [World] message`): Component = "[World]", Message = "message".
+   - Запись с `EXC` и без компонента.
+   - Запись с многострочным сообщением: `Message` = только первая строка, `LineCount` > 1.
+   - Запись с пустым сообщением (только timestamp и уровень).
+
+**Приёмка.** Сборка и тесты зелёные (≥ 114 тестов). Визуально: при открытии `Player.log` или `LogGen --count 100000` колонки выровнены, длинные сообщения не «плавают», при перезапуске ширина колонок сохраняется.
+
+**Не делать.** `OwnerDraw`, тёмная тема, exclude-фильтры, контекстное меню, live search — это шаги 12–14.
+
+---
+
 ## Приложение: `docs/DECISIONS.md`
 
 Формат: `Шаг N: <решение> — <причина>`. Записывать: отклонения от документа, выбор при неоднозначностях, изменения публичного API, найденные узкие места.
