@@ -432,9 +432,14 @@ internal sealed class MainForm : Form
         {
             _lastGeneration = currentGen;
             _filterResult = null;
-            ResetFilterControls();
             _statusLabel.Text = "Log was truncated or rotated, reindexed";
             UpdateVirtualListSizeForce();
+
+            if (!BuildFilter().IsEmpty)
+            {
+                _ = ApplyFilterAsync();
+            }
+
             return;
         }
 
