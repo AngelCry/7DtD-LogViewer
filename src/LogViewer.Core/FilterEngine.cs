@@ -78,8 +78,6 @@ public static class FilterEngine
         ArgumentNullException.ThrowIfNull(filter);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(windowSize);
 
-        // Regex создаётся до запуска задачи, чтобы невалидный шаблон падал
-        // синхронно, а не внутри фоновой задачи.
         Regex? regex = null;
         if (NeedsRegex(filter))
         {
@@ -95,6 +93,39 @@ public static class FilterEngine
 
         return Task.Run(
             () => Run(file, index, filter, regex, progress, windowSize, ct),
+            CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Инкрементально расширяет существующий результат фильтрации для новых записей индекса.
+    /// Обрабатывает диапазон <c>[previous.ProcessedCount - 1, index.Count)</c>.
+    /// </summary>
+    public static Task<FilterResult> ExtendAsync(
+        LogFile file,
+        LogIndex index,
+        FilterResult previous,
+        IProgress<int>? progress,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(index);
+        ArgumentNullException.ThrowIfNull(previous);
+
+        Regex? regex = null;
+        if (NeedsRegex(previous.Filter))
+        {
+            try
+            {
+                regex = CreateRegex(previous.Filter.Text);
+            }
+            catch (ArgumentException ex)
+            {
+                throw new ArgumentException(ex.Message, nameof(previous), ex);
+            }
+        }
+
+        return Task.Run(
+            () => Extend(file, index, previous, regex, progress, ct),
             CancellationToken.None);
     }
 
@@ -116,24 +147,136 @@ public static class FilterEngine
         var visible = new VisibleList();
         if (string.IsNullOrEmpty(filter.Text))
         {
-            RunLevelOnly(index, filter.Levels, total, visible, progress, ct);
+            RunLevelOnly(index, filter.Levels, total, 0, visible, progress, ct);
             return new FilterResult(filter, visible, total);
         }
 
-        RunWithText(file, index, filter, regex!, total, visible, progress, windowSize, ct);
+        RunWithText(file, index, filter, regex!, total, 0, visible, progress, windowSize, ct);
         return new FilterResult(filter, visible, total);
+    }
+
+    private static FilterResult Extend(
+        LogFile file,
+        LogIndex index,
+        FilterResult previous,
+        Regex? regex,
+        IProgress<int>? progress,
+        CancellationToken ct)
+    {
+        int total = index.Count;
+        LogFilter filter = previous.Filter;
+
+        if (filter.IsEmpty || previous.Visible is null)
+        {
+            return new FilterResult(filter, previous.Visible, total);
+        }
+
+        VisibleList visible = previous.Visible;
+        int startIndex = Math.Max(0, previous.ProcessedCount - 1);
+        bool levelOnly = string.IsNullOrEmpty(filter.Text);
+
+        if (startIndex < total)
+        {
+            int visibleCount = visible.Count;
+            bool isLastVisible = visibleCount > 0 && visible[visibleCount - 1] == startIndex;
+            bool matchesStart = EvaluateEntry(file, index, startIndex, filter, regex, levelOnly);
+
+            if (isLastVisible && !matchesStart)
+            {
+                visible.RemoveLast();
+            }
+            else if (!isLastVisible && matchesStart)
+            {
+                visible.Append(startIndex);
+            }
+
+            if (levelOnly)
+            {
+                RunLevelOnly(index, filter.Levels, total, startIndex + 1, visible, progress, ct);
+            }
+            else
+            {
+                RunWithText(file, index, filter, regex!, total, startIndex + 1, visible, progress, DefaultWindowSize, ct);
+            }
+        }
+
+        return new FilterResult(filter, visible, total);
+    }
+
+    private static bool EvaluateEntry(
+        LogFile file,
+        LogIndex index,
+        int i,
+        LogFilter filter,
+        Regex? regex,
+        bool levelOnly)
+    {
+        LogLevel level = index.Level(i);
+        if (!Matches(filter.Levels, level))
+        {
+            return false;
+        }
+
+        if (levelOnly)
+        {
+            return true;
+        }
+
+        long entryOffset = index.Offset(i);
+        long entryEnd = index.End(i);
+        int textLength = (int)Math.Min(entryEnd - entryOffset, TextMaxBytes);
+
+        ArrayPool<byte> pool = ArrayPool<byte>.Shared;
+        byte[] scratch = pool.Rent(textLength);
+        try
+        {
+            int read = file.Read(entryOffset, scratch.AsSpan(0, textLength));
+            ReadOnlySpan<byte> bytes = scratch.AsSpan(0, read);
+            return MatchesEntry(level, bytes, filter, regex);
+        }
+        finally
+        {
+            pool.Return(scratch);
+        }
+    }
+
+    /// <summary>
+    /// Общий метод сопоставления записи с фильтром (уровень + текст/регулярное выражение).
+    /// Используется как <see cref="RunAsync"/>, так и <see cref="ExtendAsync"/>.
+    /// </summary>
+    internal static bool MatchesEntry(
+        LogLevel level,
+        ReadOnlySpan<byte> textBytes,
+        LogFilter filter,
+        Regex? regex)
+    {
+        if (!Matches(filter.Levels, level))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(filter.Text))
+        {
+            return true;
+        }
+
+        string text = Encoding.UTF8.GetString(textBytes);
+        return filter.IsRegex
+            ? SafeIsMatch(regex!, text)
+            : text.Contains(filter.Text, StringComparison.OrdinalIgnoreCase);
     }
 
     private static void RunLevelOnly(
         LogIndex index,
         LogLevelMask levels,
         int total,
+        int startIndex,
         VisibleList visible,
         IProgress<int>? progress,
         CancellationToken ct)
     {
         int lastPercent = -1;
-        for (int i = 0; i < total; i++)
+        for (int i = startIndex; i < total; i++)
         {
             if (ct.IsCancellationRequested)
             {
@@ -155,6 +298,7 @@ public static class FilterEngine
         LogFilter filter,
         Regex regex,
         int total,
+        int startIndex,
         VisibleList visible,
         IProgress<int>? progress,
         int windowSize,
@@ -169,7 +313,7 @@ public static class FilterEngine
 
         try
         {
-            for (int i = 0; i < total; i++)
+            for (int i = startIndex; i < total; i++)
             {
                 if (ct.IsCancellationRequested)
                 {
@@ -194,13 +338,12 @@ public static class FilterEngine
                 }
                 else
                 {
-                    // Запись выходит за окно (или больше него) — читается отдельно.
                     scratch ??= pool.Rent(TextMaxBytes);
                     int read = file.Read(entryOffset, scratch.AsSpan(0, textLength));
                     bytes = scratch.AsSpan(0, read);
                 }
 
-                if (Matches(filter.Levels, index.Level(i)) && Contains(bytes, filter, regex))
+                if (MatchesEntry(index.Level(i), bytes, filter, regex))
                 {
                     visible.Append(i);
                 }
@@ -218,14 +361,6 @@ public static class FilterEngine
         }
     }
 
-    private static bool Contains(ReadOnlySpan<byte> bytes, LogFilter filter, Regex regex)
-    {
-        string text = Encoding.UTF8.GetString(bytes);
-        return filter.IsRegex
-            ? SafeIsMatch(regex, text)
-            : text.Contains(filter.Text, StringComparison.OrdinalIgnoreCase);
-    }
-
     private static bool SafeIsMatch(Regex regex, string text)
     {
         try
@@ -234,7 +369,6 @@ public static class FilterEngine
         }
         catch (RegexMatchTimeoutException)
         {
-            // Запись, на которой сработал таймаут, считается неподходящей.
             return false;
         }
     }
@@ -247,8 +381,6 @@ public static class FilterEngine
         }
         catch (NotSupportedException)
         {
-            // Не все конструкции поддерживаются NonBacktracking; для них —
-            // обычный движок с ограничением времени.
             return new Regex(pattern, BaseRegexOptions, FallbackRegexTimeout);
         }
     }

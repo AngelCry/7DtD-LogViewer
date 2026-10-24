@@ -77,6 +77,28 @@ public static class Program
                     options = options with { FinalNewline = false };
                     break;
 
+                case "--follow":
+                    options = options with { Follow = true };
+                    break;
+
+                case "--interval-ms":
+                    if (!TryReadInt(args, ref i, "--interval-ms", error, out int interval) || interval < 0)
+                    {
+                        error.WriteLine("error: --interval-ms must not be negative.");
+                        return 1;
+                    }
+                    options = options with { IntervalMs = interval };
+                    break;
+
+                case "--truncate-every-sec":
+                    if (!TryReadInt(args, ref i, "--truncate-every-sec", error, out int truncSec) || truncSec <= 0)
+                    {
+                        error.WriteLine("error: --truncate-every-sec must be positive.");
+                        return 1;
+                    }
+                    options = options with { TruncateEverySec = truncSec };
+                    break;
+
                 default:
                     if (args[i].StartsWith('-') || path is not null)
                     {
@@ -161,7 +183,7 @@ public static class Program
     private static void PrintUsage(TextWriter writer)
     {
         writer.WriteLine("Usage:");
-        writer.WriteLine("  LogGen generate <path> [--count N] [--seed S] [--crlf] [--bom] [--no-final-newline]");
+        writer.WriteLine("  LogGen generate <path> [--count N] [--seed S] [--crlf] [--bom] [--no-final-newline] [--follow [--interval-ms 100] [--truncate-every-sec N]]");
         writer.WriteLine("  LogGen bench <path>");
     }
 }

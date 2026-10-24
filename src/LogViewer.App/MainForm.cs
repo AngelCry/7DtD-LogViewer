@@ -35,6 +35,8 @@ internal sealed class MainForm : Form
     private readonly CheckBox _otherCheck;
     private readonly TextBox _textFilterBox;
     private readonly CheckBox _regexCheck;
+    private readonly CheckBox _tailCheck;
+    private readonly CheckBox _followCheck;
     private readonly ToolTip _filterToolTip;
     private readonly System.Windows.Forms.Timer _filterDebounceTimer;
 
@@ -45,6 +47,8 @@ internal sealed class MainForm : Form
     private int _filterVersion;
     private bool _suppressFilterEvents;
     private int _detailsEntryIndex = -1;
+    private int _lastGeneration;
+    private DateTime _lastSizeUpdateTick = DateTime.MinValue;
 
     public MainForm()
     {
@@ -65,6 +69,9 @@ internal sealed class MainForm : Form
         _listView.RetrieveVirtualItem += ListView_RetrieveVirtualItem;
         _listView.CacheVirtualItems += ListView_CacheVirtualItems;
         _listView.ItemSelectionChanged += ListView_ItemSelectionChanged;
+        _listView.KeyDown += ListView_KeyDown;
+        _listView.MouseWheel += ListView_MouseWheel;
+        _listView.MouseDown += ListView_MouseDown;
 
         _infoCheck = CreateLevelCheckBox("INF");
         _warningCheck = CreateLevelCheckBox("WRN");
@@ -74,10 +81,10 @@ internal sealed class MainForm : Form
 
         _textFilterBox = new TextBox
         {
-            Width = 260,
+            Width = 220,
             PlaceholderText = "Text filter",
             AccessibleName = "Text filter",
-            Margin = new Padding(8, 1, 12, 0),
+            Margin = new Padding(8, 1, 8, 0),
         };
         _textFilterBox.TextChanged += FilterInputChanged;
 
@@ -85,9 +92,25 @@ internal sealed class MainForm : Form
         {
             Text = "Regex",
             AutoSize = true,
-            Margin = new Padding(0, 3, 0, 0),
+            Margin = new Padding(0, 3, 12, 0),
         };
         _regexCheck.CheckedChanged += FilterInputChanged;
+
+        _tailCheck = new CheckBox
+        {
+            Text = "Tail",
+            Checked = true,
+            AutoSize = true,
+            Margin = new Padding(0, 3, 12, 0),
+        };
+
+        _followCheck = new CheckBox
+        {
+            Text = "Follow",
+            Checked = true,
+            AutoSize = true,
+            Margin = new Padding(0, 3, 0, 0),
+        };
 
         _filterToolTip = new ToolTip();
 
@@ -106,6 +129,8 @@ internal sealed class MainForm : Form
         filterPanel.Controls.Add(_otherCheck);
         filterPanel.Controls.Add(_textFilterBox);
         filterPanel.Controls.Add(_regexCheck);
+        filterPanel.Controls.Add(_tailCheck);
+        filterPanel.Controls.Add(_followCheck);
 
         _detailsBox = new TextBox
         {
@@ -180,8 +205,8 @@ internal sealed class MainForm : Form
         Controls.Add(statusStrip);
         Controls.Add(topPanel);
 
-        _refreshTimer = new System.Windows.Forms.Timer { Interval = 200 };
-        _refreshTimer.Tick += (_, _) => UpdateVirtualListSize();
+        _refreshTimer = new System.Windows.Forms.Timer { Interval = 300 };
+        _refreshTimer.Tick += RefreshTimer_Tick;
 
         _filterDebounceTimer = new System.Windows.Forms.Timer { Interval = 300 };
         _filterDebounceTimer.Tick += FilterDebounceTimer_Tick;
@@ -215,7 +240,51 @@ internal sealed class MainForm : Form
             return true;
         }
 
+        // Отслеживаем навигацию вверх/вниз для Follow
+        if (_followCheck.Checked && (keyData is Keys.Up || keyData is Keys.PageUp || keyData is Keys.Home))
+        {
+            _followCheck.Checked = false;
+        }
+        else if (keyData == Keys.End)
+        {
+            _followCheck.Checked = true;
+        }
+
         return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private void ListView_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (_followCheck.Checked && (e.KeyCode is Keys.Up || e.KeyCode is Keys.PageUp || e.KeyCode is Keys.Home))
+        {
+            _followCheck.Checked = false;
+        }
+        else if (e.KeyCode == Keys.End)
+        {
+            _followCheck.Checked = true;
+        }
+    }
+
+    private void ListView_MouseWheel(object? sender, MouseEventArgs e)
+    {
+        if (_followCheck.Checked && e.Delta > 0)
+        {
+            // Прокрутка вверх колесиком мыши выключает Follow
+            _followCheck.Checked = false;
+        }
+    }
+
+    private void ListView_MouseDown(object? sender, MouseEventArgs e)
+    {
+        var hit = _listView.HitTest(e.Location);
+        if (_followCheck.Checked && hit.Item is not null)
+        {
+            int visibleCount = _listView.VirtualListSize;
+            if (visibleCount > 0 && hit.Item.Index < visibleCount - 1)
+            {
+                _followCheck.Checked = false;
+            }
+        }
     }
 
     private async void OpenButton_Click(object? sender, EventArgs e)
@@ -246,6 +315,7 @@ internal sealed class MainForm : Form
         }
 
         _session = session;
+        _lastGeneration = session.Generation;
         _detailsEntryIndex = -1;
         _detailsBox.Clear();
         _listView.VirtualListSize = 0;
@@ -298,11 +368,9 @@ internal sealed class MainForm : Form
         {
             if (ReferenceEquals(_session, session))
             {
-                _refreshTimer.Stop();
-                UpdateVirtualListSize();
+                UpdateVirtualListSizeForce();
                 SetIndexingState(false);
 
-                // Индекс мог вырасти, пока фильтр уже был активен: применяем его заново.
                 if (completed && !BuildFilter().IsEmpty)
                 {
                     _ = ApplyFilterAsync();
@@ -322,6 +390,94 @@ internal sealed class MainForm : Form
     {
         _cts?.Cancel();
         _statusLabel.Text = "Cancelling…";
+    }
+
+    private async void RefreshTimer_Tick(object? sender, EventArgs e)
+    {
+        LogSession? session = _session;
+        if (session is null || IsDisposed)
+        {
+            return;
+        }
+
+        // Если идёт первоначальная индексация (когда _cts активен и не пуст), таймер просто обновляет размер списка
+        if (_cts is not null)
+        {
+            UpdateVirtualListSize();
+            return;
+        }
+
+        if (!_tailCheck.Checked)
+        {
+            return;
+        }
+
+        PollResult pollResult;
+        try
+        {
+            pollResult = await session.PollAsync(CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        if (!ReferenceEquals(_session, session) || IsDisposed)
+        {
+            return;
+        }
+
+        int currentGen = session.Generation;
+        if (currentGen != _lastGeneration)
+        {
+            _lastGeneration = currentGen;
+            _filterResult = null;
+            ResetFilterControls();
+            _statusLabel.Text = "Log was truncated or rotated, reindexed";
+            UpdateVirtualListSizeForce();
+            return;
+        }
+
+        if (pollResult.Kind == PollKind.Grown)
+        {
+            int oldCount = pollResult.OldCount;
+            int newCount = pollResult.NewCount;
+
+            // Если есть активный фильтр, делаем ExtendAsync
+            if (_filterResult is not null && !_filterResult.Filter.IsEmpty)
+            {
+                try
+                {
+                    _filterResult = await FilterEngine.ExtendAsync(
+                        session.File, session.Index, _filterResult, null, CancellationToken.None);
+                }
+                catch (Exception)
+                {
+                    // Ошибки инкрементального фильтра не должны ронять таймер
+                }
+            }
+
+            // Автопрокрутка (Follow)
+            if (_followCheck.Checked && newCount > oldCount)
+            {
+                UpdateVirtualListSizeForce();
+                int visibleCount = _filterResult?.Visible?.Count ?? newCount;
+                if (visibleCount > 0)
+                {
+                    _listView.EnsureVisible(visibleCount - 1);
+                    _listView.SelectedIndices.Clear();
+                    _listView.SelectedIndices.Add(visibleCount - 1);
+                }
+            }
+            else
+            {
+                UpdateVirtualListSize();
+            }
+        }
+        else
+        {
+            UpdateVirtualListSize();
+        }
     }
 
     private void ListView_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
@@ -366,8 +522,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception)
         {
-            // Прогрев кэша — оптимизация; сбой (например, файл закрывается)
-            // не должен ронять отрисовку.
+            // Прогрев кэша — оптимизация.
         }
     }
 
@@ -401,6 +556,15 @@ internal sealed class MainForm : Form
 
     private void ListView_ItemSelectionChanged(object? sender, ListViewItemSelectionChangedEventArgs e)
     {
+        if (_followCheck.Checked && e.IsSelected)
+        {
+            int visibleCount = _listView.VirtualListSize;
+            if (visibleCount > 0 && e.ItemIndex < visibleCount - 1)
+            {
+                _followCheck.Checked = false;
+            }
+        }
+
         int entryIndex = _listView.SelectedIndices.Count > 0
             ? MapToEntryIndex(_listView.SelectedIndices[0])
             : -1;
@@ -435,11 +599,6 @@ internal sealed class MainForm : Form
         _detailsBox.SelectionLength = 0;
     }
 
-    /// <summary>
-    /// Маппинг индекса строки списка в индекс записи <see cref="LogIndex"/>.
-    /// При активном фильтре индекс строки — позиция в <see cref="FilterResult.Visible"/>;
-    /// -1, если позиция вне списка.
-    /// </summary>
     private int MapToEntryIndex(int viewIndex)
     {
         VisibleList? visible = _filterResult?.Visible;
@@ -564,8 +723,6 @@ internal sealed class MainForm : Form
             return Encoding.UTF8.GetString(buffer, 0, read);
         }
 
-        // Очень большое непрерывное выделение: читаем блоками, но без вставки
-        // разделителей между записями и без промежуточных строк.
         var builder = new StringBuilder();
         byte[] chunk = new byte[1 << 20];
         char[] chars = new char[Encoding.UTF8.GetMaxCharCount(chunk.Length)];
@@ -591,6 +748,18 @@ internal sealed class MainForm : Form
 
     private void UpdateVirtualListSize()
     {
+        // Обновлять пачкой не чаще раза в 250 мс
+        if ((DateTime.UtcNow - _lastSizeUpdateTick).TotalMilliseconds < 250)
+        {
+            return;
+        }
+
+        UpdateVirtualListSizeForce();
+    }
+
+    private void UpdateVirtualListSizeForce()
+    {
+        _lastSizeUpdateTick = DateTime.UtcNow;
         LogSession? session = _session;
         if (session is null)
         {
@@ -600,6 +769,20 @@ internal sealed class MainForm : Form
         int count = _filterResult?.Visible?.Count ?? session.Index.Count;
         if (_listView.VirtualListSize != count)
         {
+            // Защита от уменьшения списка (если список уменьшился, проверяем SelectedIndices)
+            if (_listView.SelectedIndices.Count > 0)
+            {
+                int maxSelected = _listView.SelectedIndices[^1];
+                if (maxSelected >= count)
+                {
+                    _listView.SelectedIndices.Clear();
+                    if (_followCheck.Checked && count > 0)
+                    {
+                        _listView.SelectedIndices.Add(count - 1);
+                    }
+                }
+            }
+
             _listView.VirtualListSize = count;
         }
     }
@@ -624,7 +807,6 @@ internal sealed class MainForm : Form
             return;
         }
 
-        // Ввод изменился — результат уже запущенного прохода неактуален.
         _filterVersion++;
         _filterCts?.Cancel();
         _filterCts = null;
@@ -651,7 +833,6 @@ internal sealed class MainForm : Form
         LogFilter filter = BuildFilter();
         if (!FilterEngine.TryValidate(filter, out string? error))
         {
-            // Фильтр не применяется: остаётся предыдущий результат.
             _filterVersion++;
             _filterCts?.Cancel();
             _filterCts = null;
@@ -689,7 +870,6 @@ internal sealed class MainForm : Form
         }
         catch (OperationCanceledException)
         {
-            // Отменённый запуск не применяется.
         }
         catch (Exception ex)
         {
@@ -746,7 +926,6 @@ internal sealed class MainForm : Form
             return;
         }
 
-        // Восстанавливаем выбор на ближайшей видимой записи.
         _listView.SelectedIndices.Clear();
         _detailsEntryIndex = entryIndex;
         _listView.SelectedIndices.Add(viewIndex);
@@ -841,7 +1020,6 @@ internal sealed class MainForm : Form
         _refreshTimer.Stop();
         _filterDebounceTimer.Stop();
 
-        // Инвалидируем все запущенные фильтрации: их результаты уже неактуальны.
         _filterVersion++;
         _filterCts?.Cancel();
         _filterCts = null;

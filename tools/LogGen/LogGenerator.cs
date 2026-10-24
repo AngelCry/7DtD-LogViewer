@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 
@@ -8,7 +9,10 @@ public sealed record LogGenerationOptions(
     int Seed = 12_345,
     bool Crlf = false,
     bool Bom = false,
-    bool FinalNewline = true);
+    bool FinalNewline = true,
+    bool Follow = false,
+    int IntervalMs = 100,
+    int? TruncateEverySec = null);
 
 public readonly record struct LogGenerationResult(int Entries, long Bytes);
 
@@ -74,6 +78,12 @@ public static class LogGenerator
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         options ??= new LogGenerationOptions();
+
+        if (options.Follow)
+        {
+            return GenerateFollow(path, options);
+        }
+
         ArgumentOutOfRangeException.ThrowIfNegative(options.Count);
 
         var random = new DeterministicRandom(options.Seed);
@@ -106,58 +116,7 @@ public static class LogGenerator
         TimeSpan elapsed = TimeSpan.Zero;
         for (int i = 0; i < options.Count; i++)
         {
-            string timestamp = StartTimestamp
-                .Add(elapsed)
-                .ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
-            string seconds = elapsed.TotalSeconds.ToString("0.000", CultureInfo.InvariantCulture);
-
-            int levelRoll = random.Next(100);
-            string level;
-            bool isException = false;
-            if (levelRoll < 85)
-            {
-                level = "INF";
-            }
-            else if (levelRoll < 95)
-            {
-                level = "WRN";
-            }
-            else
-            {
-                level = "ERR";
-                isException = random.Next(100) < 20;
-                if (isException && random.Next(100) < 20)
-                {
-                    level = "EXC";
-                }
-            }
-
-            string? component = random.Next(100) < 10
-                ? null
-                : Components[random.Next(componentCount)];
-
-            string message = isException
-                ? "Unhandled exception while updating game state"
-                : random.Next(100) < 5
-                    ? CyrillicMessages[random.Next(CyrillicMessages.Length)]
-                    : EnglishMessages[random.Next(EnglishMessages.Length)];
-
-            string componentPart = component is null ? "" : $"[{component}] ";
-            WriteLine($"{timestamp} {seconds} {level} {componentPart}{message}");
-
-            if (isException)
-            {
-                int continuationCount = random.Next(5, 31);
-                WriteLine("NullReferenceException: Object reference not set to an instance of an object");
-                for (int line = 1; line < continuationCount; line++)
-                {
-                    string type = StackTypes[random.Next(StackTypes.Length)];
-                    string method = StackMethods[random.Next(StackMethods.Length)];
-                    WriteLine($"  at Game.{type}.{method} ()");
-                }
-            }
-
-            elapsed += TimeSpan.FromMilliseconds(random.Next(1, 26));
+            GenerateEntry(random, componentCount, ref elapsed, WriteLine, out _);
         }
 
         if (options.FinalNewline && wroteAny)
@@ -169,7 +128,155 @@ public static class LogGenerator
         return new LogGenerationResult(options.Count, stream.Length);
     }
 
-    /// <summary>Детерминированный PRNG, не зависящий от реализации System.Random.</summary>
+    private static LogGenerationResult GenerateFollow(string path, LogGenerationOptions options)
+    {
+        var random = new DeterministicRandom(options.Seed);
+        int componentCount = random.Next(10, 21);
+        string newLine = options.Crlf ? "\r\n" : "\n";
+
+        using var stream = new FileStream(
+            path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 64 * 1024, FileOptions.SequentialScan);
+
+        if (options.Bom)
+        {
+            stream.Write(Encoding.UTF8.GetPreamble());
+        }
+
+        using var writer = new StreamWriter(stream, new UTF8Encoding(false), 64 * 1024);
+        bool wroteAny = false;
+
+        void WriteLine(string text)
+        {
+            if (wroteAny)
+            {
+                writer.Write(newLine);
+            }
+
+            writer.Write(text);
+            wroteAny = true;
+        }
+
+        TimeSpan elapsed = TimeSpan.Zero;
+        int entryCount = 0;
+        var stopwatch = Stopwatch.StartNew();
+        long lastTruncateTicks = 0;
+
+        while (true)
+        {
+            if (options.TruncateEverySec is { } truncateSec && truncateSec > 0)
+            {
+                if (stopwatch.ElapsedMilliseconds - lastTruncateTicks >= truncateSec * 1000L)
+                {
+                    writer.Flush();
+                    stream.SetLength(0);
+                    stream.Position = 0;
+                    wroteAny = false;
+                    lastTruncateTicks = stopwatch.ElapsedMilliseconds;
+                }
+            }
+
+            bool splitEntry = entryCount > 0 && entryCount % 20 == 0;
+            if (splitEntry)
+            {
+                string timestamp = StartTimestamp.Add(elapsed).ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+                string seconds = elapsed.TotalSeconds.ToString("0.000", CultureInfo.InvariantCulture);
+                string message = EnglishMessages[random.Next(EnglishMessages.Length)];
+                string partialLine = $"{timestamp} {seconds} INF [System] {message}";
+
+                if (wroteAny)
+                {
+                    writer.Write(newLine);
+                }
+                writer.Write(partialLine);
+                writer.Flush();
+                wroteAny = true;
+
+                Thread.Sleep(Math.Max(150, options.IntervalMs));
+
+                writer.Write(" (continued)");
+                writer.Flush();
+
+                entryCount++;
+                elapsed += TimeSpan.FromMilliseconds(random.Next(1, 26));
+            }
+            else
+            {
+                GenerateEntry(random, componentCount, ref elapsed, WriteLine, out bool isException);
+                writer.Flush();
+                entryCount++;
+
+                if (isException && entryCount % 50 == 0)
+                {
+                    Thread.Sleep(200);
+                }
+            }
+
+            Thread.Sleep(options.IntervalMs);
+        }
+    }
+
+    private static void GenerateEntry(
+        DeterministicRandom random,
+        int componentCount,
+        ref TimeSpan elapsed,
+        Action<string> writeLine,
+        out bool isException)
+    {
+        string timestamp = StartTimestamp
+            .Add(elapsed)
+            .ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+        string seconds = elapsed.TotalSeconds.ToString("0.000", CultureInfo.InvariantCulture);
+
+        int levelRoll = random.Next(100);
+        string level;
+        isException = false;
+        if (levelRoll < 85)
+        {
+            level = "INF";
+        }
+        else if (levelRoll < 95)
+        {
+            level = "WRN";
+        }
+        else
+        {
+            level = "ERR";
+            isException = random.Next(100) < 20;
+            if (isException && random.Next(100) < 20)
+            {
+                level = "EXC";
+            }
+        }
+
+        string? component = random.Next(100) < 10
+            ? null
+            : Components[random.Next(componentCount)];
+
+        string message = isException
+            ? "Unhandled exception while updating game state"
+            : random.Next(100) < 5
+                ? CyrillicMessages[random.Next(CyrillicMessages.Length)]
+                : EnglishMessages[random.Next(EnglishMessages.Length)];
+
+        string componentPart = component is null ? "" : $"[{component}] ";
+        writeLine($"{timestamp} {seconds} {level} {componentPart}{message}");
+
+        if (isException)
+        {
+            int continuationCount = random.Next(5, 31);
+            writeLine("NullReferenceException: Object reference not set to an instance of an object");
+            for (int line = 1; line < continuationCount; line++)
+            {
+                string type = StackTypes[random.Next(StackTypes.Length)];
+                string method = StackMethods[random.Next(StackMethods.Length)];
+                writeLine($"  at Game.{type}.{method} ()");
+            }
+        }
+
+        elapsed += TimeSpan.FromMilliseconds(random.Next(1, 26));
+    }
+
     private sealed class DeterministicRandom
     {
         private ulong _state;
@@ -201,7 +308,6 @@ public static class LogGenerator
 
         private ulong NextUInt64()
         {
-            // SplitMix64.
             _state += 0x9E3779B97F4A7C15UL;
             ulong z = _state;
             z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
